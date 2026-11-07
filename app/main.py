@@ -5,6 +5,7 @@ from collections import defaultdict, deque
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from openai import RateLimitError
 from pydantic import BaseModel
 
 from . import agent, config, tools
@@ -44,10 +45,24 @@ def chat(body: ChatIn, request: Request):
     sid = body.session_id or uuid.uuid4().hex
     try:
         out = agent.chat(sid, msg)
+    except RateLimitError as e:
+        print("chat error: Groq rate limit:", str(e)[:300])
+        _rollback(sid)
+        raise HTTPException(429, "I'm getting a lot of questions right now. Please try again in a minute.")
     except Exception as e:
-        print("chat error:", repr(e))
+        print("chat error:", repr(e)[:500])
+        _rollback(sid)
         raise HTTPException(502, "The assistant is having trouble right now. Please try again.")
     return {"session_id": sid, **out}
+
+
+def _rollback(sid):
+    """Drop the failed turn (user message + half-finished tool steps) so the user can simply resend."""
+    hist = agent.SESSIONS.get(sid, [])
+    while hist and hist[-1]["role"] != "user":
+        hist.pop()
+    if hist:
+        hist.pop()
 
 
 @app.post("/api/reset")

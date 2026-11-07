@@ -1,8 +1,10 @@
 """Conversation loop: Groq (OpenAI-compatible) chat completions + local tool calling."""
 import json
+import re
+import time
 from datetime import date
 
-from openai import OpenAI
+from openai import BadRequestError, OpenAI, RateLimitError
 
 from . import config, tools
 
@@ -18,6 +20,7 @@ How to help:
 - If nothing matches, say so honestly, suggest the closest alternative (nearby category, online option, or another city) and suggest browsing magickworld.in.
 - When the user wants to book or contact a vendor, share that vendor's listing link (contact options are on the listing page). Don't ask for phone numbers.
 - Don't share vendor contact person names or emails; point to the listing page instead.
+- Stays (hotels, resorts, homestays) are not listed on MagickWorld yet. If asked, say stays are coming soon, then offer related experiences (e.g. day trips, safaris, the overnight campout) using search_vendors with category 'Experiences'. Never present a class, shop or clinic as a place to stay.
 - When sharing a link, write it as a markdown link, e.g. [View listing](https://magickworld.in/listing/...). Only use URLs that came from tool results.
 - If asked your name, you are Magick AI.
 - Stay on MagickWorld topics. Keep replies short, warm and conversational (2–5 sentences), in the user's language (English or Hinglish/Hindi is fine).
@@ -34,6 +37,62 @@ def client():
 
 
 SESSIONS: dict[str, list] = {}
+
+
+def _complete(llm, messages):
+    """One Groq call. Retries once when Groq rejects a malformed tool call (a known, occasional model glitch)."""
+    bad_requests = 0
+    for attempt in range(4):
+        try:
+            return llm.chat.completions.create(model=config.LLM_MODEL, messages=messages, tools=tools.TOOL_SCHEMAS,
+                                               tool_choice="auto", temperature=0.3)
+        except RateLimitError as e:
+            # free tier: tokens-per-minute limit. Groq says how long to wait ("try again in 7.08s"); wait and retry.
+            m = re.search(r"try again in ([\d.]+)s", str(e))
+            wait = min(float(m.group(1)) + 0.5 if m else 10, 30)
+            print(f"groq rate limit, waiting {wait:.1f}s (attempt {attempt + 1})")
+            if attempt == 3:
+                raise
+            time.sleep(wait)
+        except BadRequestError as e:
+            print(f"groq bad request (attempt {attempt + 1}):", str(e)[:300])
+            bad_requests += 1
+            if "tool" not in str(e).lower() or bad_requests == 2:
+                raise
+
+
+LLM_FIELDS = ("id", "name", "ages", "price", "mode", "city", "address", "distance_km", "about", "listing_url", "matched")
+
+
+def _for_llm(result):
+    """Smaller copy of a tool result for the model (saves tokens; cards keep the full data)."""
+    if not isinstance(result, dict) or "results" not in result:
+        return result
+    slim = []
+    for c in result["results"]:
+        c = {k: c.get(k) for k in LLM_FIELDS if c.get(k) not in (None, [], "")}
+        if c.get("address"):
+            c["address"] = c["address"][:90]
+        if c.get("about"):
+            c["about"] = c["about"][:180]
+        slim.append(c)
+    return {"total_matches": result["total_matches"], "results": slim, "note": result.get("note")}
+
+
+def _compact_old_turns(history):
+    """Once a turn is answered, shrink its tool results to id/name/price/link so history stays small."""
+    for m in history:
+        if m["role"] == "tool" and not m.get("_compact"):
+            try:
+                data = json.loads(m["content"])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict) and "results" in data:
+                data = {"results": [{k: r.get(k) for k in ("id", "name", "price", "listing_url")} for r in data["results"]]}
+            elif isinstance(data, dict) and "id" in data and "name" in data:  # vendor details
+                data = {k: data.get(k) for k in ("id", "name", "price", "listing_url")}
+            m["content"] = json.dumps(data, ensure_ascii=False)
+            m["_compact"] = True
 
 
 def _run_tool(name, args, session_id):
@@ -58,17 +117,15 @@ def chat(session_id: str, user_message: str, llm=None):
     seen_cards = {}
 
     for _ in range(config.MAX_TOOL_ROUNDS):
-        resp = llm.chat.completions.create(
-            model=config.LLM_MODEL,
-            messages=[system] + history[-config.MAX_HISTORY_MESSAGES:],
-            tools=tools.TOOL_SCHEMAS,
-            tool_choice="auto",
-            temperature=0.3,
-        )
+        recent = history[-config.MAX_HISTORY_MESSAGES:]
+        while recent and recent[0]["role"] == "tool":
+            recent = recent[1:]  # a tool message can't start the context
+        resp = _complete(llm, [system] + [{k: v for k, v in m.items() if k != "_compact"} for m in recent])
         msg = resp.choices[0].message
         if not msg.tool_calls:
             reply = (msg.content or "").strip()
             history.append({"role": "assistant", "content": reply})
+            _compact_old_turns(history)
             cards = [c for c in seen_cards.values() if c["name"].lower() in reply.lower()]
             return {"reply": reply, "cards": cards[:3]}
 
@@ -86,7 +143,7 @@ def chat(session_id: str, user_message: str, llm=None):
                 if isinstance(c, dict) and "id" in c and "name" in c:
                     seen_cards[c["id"]] = {k: c.get(k) for k in
                                            ("id", "name", "ages", "price", "address", "distance_km", "listing_url", "image")}
-            history.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(result, ensure_ascii=False)})
+            history.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(_for_llm(result), ensure_ascii=False)})
 
     fallback = "Sorry, I got a bit stuck there. Could you rephrase that?"
     history.append({"role": "assistant", "content": fallback})
